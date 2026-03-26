@@ -7,6 +7,44 @@ const app = express();
 // but shares the same app credentials (client_id + client_secret).
 const refreshTokens = {};
 
+// Persist a rotated refresh token back to Railway env vars so it survives restarts.
+// Without this, Jobber's token rotation means the env var goes stale after first use.
+async function persistTokenToRailway(subEntity, newToken) {
+  const apiToken = process.env.RAILWAY_API_TOKEN;
+  if (!apiToken) return; // no token = skip persistence silently
+
+  // Convert sub-entity name back to env var format (wise-gd → WISE_GD)
+  const envSuffix = subEntity.toUpperCase().replace(/-/g, '_');
+  const envName = subEntity === 'default'
+    ? 'JOBBER_REFRESH_TOKEN'
+    : `JOBBER_REFRESH_TOKEN_${envSuffix}`;
+
+  try {
+    await fetch('https://backboard.railway.com/graphql/v2', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiToken}`
+      },
+      body: JSON.stringify({
+        query: `mutation($input: VariableUpsertInput!) { variableUpsert(input: $input) }`,
+        variables: {
+          input: {
+            projectId: process.env.RAILWAY_PROJECT_ID,
+            environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
+            serviceId: process.env.RAILWAY_SERVICE_ID,
+            name: envName,
+            value: newToken
+          }
+        }
+      })
+    });
+    console.log(`Persisted rotated token for ${subEntity} → ${envName}`);
+  } catch (err) {
+    console.error(`Failed to persist token for ${subEntity}: ${err.message}`);
+  }
+}
+
 // Load all sub-entity tokens from env vars (JOBBER_REFRESH_TOKEN_{SUB_ENTITY})
 function loadTokens() {
   for (const [key, value] of Object.entries(process.env)) {
@@ -51,9 +89,10 @@ app.get('/token/:subEntity?', async (req, res) => {
 
     const data = await response.json();
 
-    // Jobber rotates refresh tokens — store the new one
+    // Jobber rotates refresh tokens — store the new one and persist to Railway
     if (data.refresh_token) {
       refreshTokens[subEntity] = data.refresh_token;
+      persistTokenToRailway(subEntity, data.refresh_token);
     }
 
     res.json({
@@ -106,9 +145,10 @@ app.get('/callback', async (req, res) => {
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
-    // Store the fresh refresh token in memory
+    // Store the fresh refresh token in memory and persist to Railway
     if (data.refresh_token) {
       refreshTokens[subEntity] = data.refresh_token;
+      persistTokenToRailway(subEntity, data.refresh_token);
     }
 
     res.send(
