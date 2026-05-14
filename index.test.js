@@ -372,4 +372,61 @@ test.describe('GET /callback — validates the auth-code exchange before reporti
     assert.equal(response.status, 502);
     assert.notEqual(response.status, 200);
   });
+
+  test('t12: returns 502 when Jobber returns an access_token but no refresh_token', async () => {
+    // The OAuth flow exists to obtain a REFRESH token. An access token alone
+    // leaves refreshTokens[subEntity] unset — GET /token would still fail — so
+    // a missing refresh_token must NOT be reported as onboarding success.
+    _setTokensForTest({});
+    fetchStub = async (url) => {
+      if (url.includes('getjobber.com')) {
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { access_token: 'AT-1' }, // no refresh_token
+          textBody: '',
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    setFetch(fetchStub);
+
+    const { server, baseUrl } = await startApp();
+    currentServer = server;
+
+    const response = await fetch(`${baseUrl}/callback?code=auth-code-123&state=wise-gd`);
+
+    assert.equal(response.status, 502);
+    assert.notEqual(response.status, 200);
+  });
+});
+
+test.describe('GET /token/:subEntity — a refresh with no rotated token is not success', () => {
+  test('t13: returns 502 when Jobber returns access_token but no refresh_token', async () => {
+    // Jobber refresh tokens are single-use. A 200 with access_token but no
+    // refresh_token means the old token may now be revoked and there is nothing
+    // valid to store — serving a 200 here would 502 on the very next refresh.
+    _setTokensForTest({ 'wise-gd': 'refresh-abc' });
+    fetchStub = async (url) => {
+      if (url.includes('getjobber.com')) {
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { access_token: 'AT-1' }, // no refresh_token
+          textBody: '',
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    setFetch(fetchStub);
+
+    const { server, baseUrl } = await startApp();
+    currentServer = server;
+
+    const response = await fetch(`${baseUrl}/token/wise-gd`);
+    const body = await response.json();
+
+    assert.equal(response.status, 502);
+    assert.match(body.error, /no rotated refresh token/i);
+  });
 });

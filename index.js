@@ -204,6 +204,26 @@ async function refreshSubEntityToken(subEntity) {
         }
       };
     }
+
+    // A successful refresh MUST also rotate the refresh token. Jobber's refresh
+    // tokens are single-use — if the response carries an access_token but no
+    // refresh_token, the old refresh token may already be revoked and we have
+    // nothing valid to store. Returning 200 here would serve one access token
+    // and then fail invalid_grant on the very next refresh. Treat a missing
+    // rotated token as an upstream contract violation (502), not a success.
+    if (!data.refresh_token) {
+      return {
+        status: 502,
+        body: {
+          error: 'Jobber refresh succeeded but returned no rotated refresh token',
+          detail: `The access token was issued but no new refresh token came back ` +
+            `for '${subEntity}'. The stored refresh token may now be revoked. ` +
+            `Re-run the OAuth flow for this sub-entity.`,
+          jobber_status: response.status,
+          sub_entity: subEntity
+        }
+      };
+    }
   } catch (err) {
     // Network-level failure reaching Jobber — upstream unreachable.
     return {
@@ -215,38 +235,38 @@ async function refreshSubEntityToken(subEntity) {
     };
   }
 
-  // Jobber rotates refresh tokens and the OLD token may already be revoked the
-  // moment this refresh succeeded. So the rotated token is the ONLY valid token
-  // now — it MUST go into memory immediately, regardless of whether the durable
-  // write to Railway then succeeds. (Discarding it on a Railway failure would
-  // turn a transient blip into a hard invalid_grant outage, because the next
-  // request would retry with the revoked old token.)
+  // At this point a rotated refresh_token is guaranteed present (the checks
+  // above return 502 otherwise). Jobber rotates refresh tokens and the OLD
+  // token may already be revoked the moment this refresh succeeded — so the
+  // rotated token is the ONLY valid token now, and it MUST go into memory
+  // immediately, regardless of whether the durable write to Railway then
+  // succeeds. (Discarding it on a Railway failure would turn a transient blip
+  // into a hard invalid_grant outage, because the next request would retry
+  // with the revoked old token.)
   //
   // Persistence to Railway is a SEPARATE durability concern. If it fails, the
   // in-memory token still works for the life of this process; we mark the
   // sub-entity non-durable and return 503 so the caller knows a restart would
   // lose the token — but the token itself is kept, not thrown away.
-  if (data.refresh_token) {
-    refreshTokens[subEntity] = data.refresh_token;
-    try {
-      await persistTokenToRailway(subEntity, data.refresh_token);
-      nonDurableTokens.delete(subEntity);
-    } catch (err) {
-      nonDurableTokens.add(subEntity);
-      console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
-      return {
-        status: 503,
-        body: {
-          error: 'Refresh token rotated and is in use, but could not be persisted',
-          detail: `Jobber rotated the refresh token for '${subEntity}'. The new token ` +
-            `is held in memory and works for now, but writing it back to Railway ` +
-            `failed — a service restart would lose it. Investigate Railway API ` +
-            `credentials/IDs before relying on this sub-entity across a restart.`,
-          non_durable: true,
-          sub_entity: subEntity
-        }
-      };
-    }
+  refreshTokens[subEntity] = data.refresh_token;
+  try {
+    await persistTokenToRailway(subEntity, data.refresh_token);
+    nonDurableTokens.delete(subEntity);
+  } catch (err) {
+    nonDurableTokens.add(subEntity);
+    console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
+    return {
+      status: 503,
+      body: {
+        error: 'Refresh token rotated and is in use, but could not be persisted',
+        detail: `Jobber rotated the refresh token for '${subEntity}'. The new token ` +
+          `is held in memory and works for now, but writing it back to Railway ` +
+          `failed — a service restart would lose it. Investigate Railway API ` +
+          `credentials/IDs before relying on this sub-entity across a restart.`,
+        non_durable: true,
+        sub_entity: subEntity
+      }
+    };
   }
 
   return {
@@ -352,28 +372,42 @@ app.get('/callback', async (req, res) => {
         sub_entity: subEntity
       });
     }
+    // The whole point of the OAuth flow is to obtain a REFRESH token — that is
+    // what this service stores and serves. An access token alone is useless
+    // here: there would be nothing to put in `refreshTokens[subEntity]`, and
+    // `GET /token/:subEntity` would still fail. So a successful authorization-
+    // code exchange MUST include a refresh_token; treat its absence as a 502
+    // and never report onboarding success.
+    if (!data.refresh_token) {
+      return res.status(502).json({
+        error: 'Jobber returned an access token but no refresh token for the authorization code',
+        detail: `The OAuth flow for '${subEntity}' did not yield a refresh token, so ` +
+          `the sub-entity cannot be registered. Re-run the OAuth flow.`,
+        jobber_status: response.status,
+        sub_entity: subEntity
+      });
+    }
 
     // A fresh OAuth grant produces a brand-new refresh token — keep it in
     // memory immediately so a Railway persistence failure does not throw away
     // a token the user just authorized. Then attempt the durable write; on
     // failure, mark the sub-entity non-durable and report it, but retain the
-    // working token. Same model as the /token route.
-    if (data.refresh_token) {
-      refreshTokens[subEntity] = data.refresh_token;
-      try {
-        await persistTokenToRailway(subEntity, data.refresh_token);
-        nonDurableTokens.delete(subEntity);
-      } catch (err) {
-        nonDurableTokens.add(subEntity);
-        console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
-        return res.status(503).send(
-          `<h2>Jobber OAuth completed for "${subEntity}" — but persistence FAILED</h2>` +
-          `<p>An access token was obtained and the refresh token is held in memory ` +
-          `(it works for now), but writing it back to Railway failed: ${err.message}</p>` +
-          `<p><strong>A service restart would lose this token.</strong> ` +
-          `Fix the Railway API credentials/IDs, then re-run the OAuth flow to persist it.</p>`
-        );
-      }
+    // working token. Same model as the /token route. (A refresh_token is
+    // guaranteed present here — the check above returns 502 otherwise.)
+    refreshTokens[subEntity] = data.refresh_token;
+    try {
+      await persistTokenToRailway(subEntity, data.refresh_token);
+      nonDurableTokens.delete(subEntity);
+    } catch (err) {
+      nonDurableTokens.add(subEntity);
+      console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
+      return res.status(503).send(
+        `<h2>Jobber OAuth completed for "${subEntity}" — but persistence FAILED</h2>` +
+        `<p>An access token was obtained and the refresh token is held in memory ` +
+        `(it works for now), but writing it back to Railway failed: ${err.message}</p>` +
+        `<p><strong>A service restart would lose this token.</strong> ` +
+        `Fix the Railway API credentials/IDs, then re-run the OAuth flow to persist it.</p>`
+      );
     }
 
     res.send(
