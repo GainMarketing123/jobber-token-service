@@ -21,6 +21,16 @@ const refreshTokens = {};
 // /accounts) instead of silent. An entry is cleared once persistence succeeds.
 const nonDurableTokens = new Set();
 
+// In-flight refresh promises, keyed by sub-entity. Jobber's refresh tokens are
+// single-use: if two requests for the same sub-entity both read the same old
+// token and each fire a refresh, the first to land may revoke the token and the
+// second comes back invalid_grant — an intermittent 502 caused purely by request
+// timing. Serializing per sub-entity means concurrent callers share ONE refresh:
+// the first starts it, the rest await the same promise. Different sub-entities
+// still refresh in parallel (they have independent tokens). The entry is removed
+// once the refresh settles so the next request starts fresh.
+const inFlightRefreshes = {};
+
 // Persist a rotated refresh token back to Railway env vars so it survives restarts.
 // Without this, Jobber's token rotation means the env var goes stale after first use.
 //
@@ -141,6 +151,7 @@ function loadTokens() {
 // going through env vars, and keeps tests independent of each other.
 function _setTokensForTest(tokens) {
   for (const key of Object.keys(refreshTokens)) delete refreshTokens[key];
+  for (const key of Object.keys(inFlightRefreshes)) delete inFlightRefreshes[key];
   nonDurableTokens.clear();
   Object.assign(refreshTokens, tokens || {});
 }
@@ -153,25 +164,15 @@ function _getTokenForTest(subEntity) {
 
 loadTokens();
 
-// GET /token/:subEntity — refresh token for a specific sub-entity
-// GET /token — backward compat, uses 'default' or first available
-app.get('/token/:subEntity?', async (req, res) => {
-  const subEntity = (req.params.subEntity || 'default').toLowerCase();
-
-  if (!refreshTokens[subEntity]) {
-    // Explicit rejection: the sub-entity is not registered (no refresh-token slot,
-    // or the slot exists but is empty/stubbed — e.g. icare before acquisition close).
-    const available = Object.keys(refreshTokens);
-    return res.status(404).json({
-      error: `Sub-entity '${subEntity}' is not registered`,
-      detail: `No refresh token is configured for '${subEntity}'. ` +
-        `Set JOBBER_REFRESH_TOKEN_${subEntity.toUpperCase().replace(/-/g, '_')} ` +
-        `and restart the service to register it.`,
-      sub_entity: subEntity,
-      available_sub_entities: available
-    });
-  }
-
+// Refresh one sub-entity's token against Jobber and persist the rotation.
+// Returns a result object the route maps straight to an HTTP response:
+//   { status: 200, body: { access_token, sub_entity } }
+//   { status: 502, body: {...} }  — Jobber rejected the token / was unreachable
+//   { status: 503, body: {...} }  — token rotated and in use, but not persisted
+// Never throws for these expected outcomes — the route stays a thin mapper.
+//
+// The caller is expected to have already verified refreshTokens[subEntity] exists.
+async function refreshSubEntityToken(subEntity) {
   let data;
   try {
     const response = await fetch('https://api.getjobber.com/api/oauth/token', {
@@ -192,21 +193,26 @@ app.get('/token/:subEntity?', async (req, res) => {
     // (Jobber returns `invalid_grant` for a rejected/expired refresh token) means
     // the token is bad — return 502 Bad Gateway, never a misleading 200.
     if (!response.ok || data.error || !data.access_token) {
-      return res.status(502).json({
-        error: 'Jobber rejected the refresh token',
-        jobber_status: response.status,
-        jobber_error: data.error || null,
-        jobber_error_description: data.error_description || null,
-        sub_entity: subEntity
-      });
+      return {
+        status: 502,
+        body: {
+          error: 'Jobber rejected the refresh token',
+          jobber_status: response.status,
+          jobber_error: data.error || null,
+          jobber_error_description: data.error_description || null,
+          sub_entity: subEntity
+        }
+      };
     }
-
   } catch (err) {
     // Network-level failure reaching Jobber — upstream unreachable.
-    return res.status(502).json({
-      error: `Failed to reach Jobber OAuth endpoint: ${err.message}`,
-      sub_entity: subEntity
-    });
+    return {
+      status: 502,
+      body: {
+        error: `Failed to reach Jobber OAuth endpoint: ${err.message}`,
+        sub_entity: subEntity
+      }
+    };
   }
 
   // Jobber rotates refresh tokens and the OLD token may already be revoked the
@@ -228,22 +234,71 @@ app.get('/token/:subEntity?', async (req, res) => {
     } catch (err) {
       nonDurableTokens.add(subEntity);
       console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
-      return res.status(503).json({
-        error: 'Refresh token rotated and is in use, but could not be persisted',
-        detail: `Jobber rotated the refresh token for '${subEntity}'. The new token ` +
-          `is held in memory and works for now, but writing it back to Railway ` +
-          `failed — a service restart would lose it. Investigate Railway API ` +
-          `credentials/IDs before relying on this sub-entity across a restart.`,
-        non_durable: true,
-        sub_entity: subEntity
-      });
+      return {
+        status: 503,
+        body: {
+          error: 'Refresh token rotated and is in use, but could not be persisted',
+          detail: `Jobber rotated the refresh token for '${subEntity}'. The new token ` +
+            `is held in memory and works for now, but writing it back to Railway ` +
+            `failed — a service restart would lose it. Investigate Railway API ` +
+            `credentials/IDs before relying on this sub-entity across a restart.`,
+          non_durable: true,
+          sub_entity: subEntity
+        }
+      };
     }
   }
 
-  res.json({
-    access_token: data.access_token,
-    sub_entity: subEntity
-  });
+  return {
+    status: 200,
+    body: {
+      access_token: data.access_token,
+      sub_entity: subEntity
+    }
+  };
+}
+
+// GET /token/:subEntity — refresh token for a specific sub-entity
+// GET /token — backward compat, uses 'default' or first available
+app.get('/token/:subEntity?', async (req, res) => {
+  const subEntity = (req.params.subEntity || 'default').toLowerCase();
+
+  if (!refreshTokens[subEntity]) {
+    // Explicit rejection: the sub-entity is not registered (no refresh-token slot,
+    // or the slot exists but is empty/stubbed — e.g. icare before acquisition close).
+    const available = Object.keys(refreshTokens);
+    return res.status(404).json({
+      error: `Sub-entity '${subEntity}' is not registered`,
+      detail: `No refresh token is configured for '${subEntity}'. ` +
+        `Set JOBBER_REFRESH_TOKEN_${subEntity.toUpperCase().replace(/-/g, '_')} ` +
+        `and restart the service to register it.`,
+      sub_entity: subEntity,
+      available_sub_entities: available
+    });
+  }
+
+  // Serialize refreshes per sub-entity. If a refresh for this sub-entity is
+  // already in flight, await THAT promise instead of firing a second Jobber
+  // call — Jobber's single-use refresh tokens make concurrent refreshes race,
+  // where the first to land revokes the token and the second 502s for no real
+  // reason. The first request to arrive owns the refresh; the rest piggyback.
+  // The in-flight entry is cleared in `finally` so the next request after this
+  // one settles starts a fresh refresh.
+  let result;
+  try {
+    if (!inFlightRefreshes[subEntity]) {
+      inFlightRefreshes[subEntity] = refreshSubEntityToken(subEntity)
+        .finally(() => { delete inFlightRefreshes[subEntity]; });
+    }
+    result = await inFlightRefreshes[subEntity];
+  } catch (err) {
+    // refreshSubEntityToken is written not to throw for expected outcomes; an
+    // exception here is an unexpected internal fault. Fail closed with a 500.
+    console.error(`Unexpected refresh fault for ${subEntity}: ${err.message}`);
+    return res.status(500).json({ error: err.message, sub_entity: subEntity });
+  }
+
+  res.status(result.status).json(result.body);
 });
 
 // GET /auth — kick off OAuth flow (redirects browser to Jobber)
@@ -282,8 +337,20 @@ app.get('/callback', async (req, res) => {
 
     const data = await response.json();
 
+    // Validate the auth-code exchange the same way /token validates a refresh.
+    // Jobber can return an `error` field, a non-2xx status, or a 200 body that
+    // is simply missing `access_token` — all of those mean no usable token was
+    // obtained. Without this check the route would fall through to the success
+    // HTML and tell the operator OAuth completed when it did not.
     if (data.error) {
       return res.status(400).json({ error: data.error, description: data.error_description });
+    }
+    if (!response.ok || !data.access_token) {
+      return res.status(502).json({
+        error: 'Jobber did not return a usable token for the authorization code',
+        jobber_status: response.status,
+        sub_entity: subEntity
+      });
     }
 
     // A fresh OAuth grant produces a brand-new refresh token — keep it in

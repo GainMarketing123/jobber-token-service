@@ -293,3 +293,83 @@ test.describe('GET /token/:subEntity — finding 2.3: explicit rejection for unr
     assert.match(body.error, /not registered/i);
   });
 });
+
+test.describe('GET /token/:subEntity — concurrency: per-sub-entity refresh is deduplicated', () => {
+  test('t10: two concurrent requests for the same sub-entity share ONE Jobber refresh', async () => {
+    // Jobber's refresh tokens are single-use. If concurrent requests each fire
+    // their own refresh, one wins and revokes the token, the other 502s. The
+    // service must serialize per sub-entity so concurrent callers share one
+    // refresh — exactly one Jobber call, both callers get the same 200.
+    _setTokensForTest({ 'wise-gd': 'refresh-abc' });
+
+    let jobberCalls = 0;
+    fetchStub = async (url) => {
+      if (url.includes('getjobber.com')) {
+        jobberCalls += 1;
+        // Small delay so the second request arrives while the first is in flight.
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { access_token: 'AT-1', refresh_token: 'RT-2' },
+          textBody: '',
+        });
+      }
+      if (url.includes('railway.com')) {
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { data: { variableUpsert: true } },
+          textBody: '',
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    setFetch(fetchStub);
+
+    const { server, baseUrl } = await startApp();
+    currentServer = server;
+
+    const [r1, r2] = await Promise.all([
+      fetch(`${baseUrl}/token/wise-gd`),
+      fetch(`${baseUrl}/token/wise-gd`),
+    ]);
+    const [b1, b2] = await Promise.all([r1.json(), r2.json()]);
+
+    // Both callers succeed with the same token...
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(b1.access_token, 'AT-1');
+    assert.equal(b2.access_token, 'AT-1');
+    // ...because the refresh was deduplicated: exactly one Jobber call.
+    assert.equal(jobberCalls, 1);
+  });
+});
+
+test.describe('GET /callback — validates the auth-code exchange before reporting success', () => {
+  test('t11: returns 502 when Jobber returns 200 with no access_token', async () => {
+    // A 200 body missing access_token (and with no `error` field) must NOT be
+    // reported as a completed OAuth flow — that is a false-positive onboarding.
+    _setTokensForTest({});
+    fetchStub = async (url) => {
+      if (url.includes('getjobber.com')) {
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { something_else: true },
+          textBody: '',
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    setFetch(fetchStub);
+
+    const { server, baseUrl } = await startApp();
+    currentServer = server;
+
+    const response = await fetch(`${baseUrl}/callback?code=auth-code-123&state=wise-gd`);
+
+    assert.equal(response.status, 502);
+    assert.notEqual(response.status, 200);
+  });
+});
