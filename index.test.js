@@ -123,6 +123,25 @@ test.describe('persistTokenToRailway — finding 2.2: fail closed on Railway wri
       await persistTokenToRailway('wise-gd', 'tok');
     });
   });
+
+  test('t5b: throws when Railway returns 200 but does not confirm the write', async () => {
+    // Railway can return a structurally valid 200 with no `errors` array yet
+    // still report the mutation did not land (variableUpsert: false / data: null).
+    // That must NOT be treated as a durable write.
+    fetchStub = async () =>
+      createResponse({
+        ok: true,
+        status: 200,
+        jsonBody: { data: { variableUpsert: false } },
+        textBody: '',
+      });
+    setFetch(fetchStub);
+
+    await assert.rejects(
+      persistTokenToRailway('wise-gd', 'tok'),
+      TokenPersistenceError
+    );
+  });
 });
 
 test.describe('GET /token/:subEntity — finding 2.1: surface Jobber rejection as 502', () => {

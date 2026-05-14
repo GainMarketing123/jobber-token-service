@@ -95,6 +95,19 @@ async function persistTokenToRailway(subEntity, newToken) {
     );
   }
 
+  // A structurally valid HTTP 200 with no `errors` array is still not proof the
+  // write landed — Railway can return `{ data: { variableUpsert: false } }` or
+  // `{ data: null }`. The mutation contract is `variableUpsert: Boolean`, so
+  // require an explicit `true` before treating the write as durable.
+  if (!body || !body.data || body.data.variableUpsert !== true) {
+    let summary;
+    try { summary = JSON.stringify(body); } catch (_) { summary = String(body); }
+    throw new TokenPersistenceError(
+      `Railway API did not confirm the write for ${subEntity} → ${envName} ` +
+      `(expected data.variableUpsert === true): ${String(summary).slice(0, 500)}`
+    );
+  }
+
   console.log(`Persisted rotated token for ${subEntity} → ${envName}`);
 }
 
@@ -178,12 +191,15 @@ app.get('/token/:subEntity?', async (req, res) => {
     });
   }
 
-  // Jobber rotates refresh tokens — store the new one and persist to Railway.
-  // Persistence MUST succeed: if the rotated token is not written back, the next
-  // refresh uses a stale token and the integration goes down. Fail closed (503)
-  // so the caller knows the rotated state is not durable.
+  // Jobber rotates refresh tokens — persist the new one to Railway FIRST, then
+  // update the in-memory copy only after the durable write succeeds. Order matters:
+  // if we mutated refreshTokens[subEntity] before persisting and persistence then
+  // failed, in-process refreshes would keep succeeding with the new token while
+  // Railway still holds the old one — masking the failure until the next restart,
+  // when the service reloads the stale env token and the integration breaks.
+  // Persisting first means a persistence failure leaves both memory and Railway
+  // on the previous token: consistent, and the 503 is the only signal needed.
   if (data.refresh_token) {
-    refreshTokens[subEntity] = data.refresh_token;
     try {
       await persistTokenToRailway(subEntity, data.refresh_token);
     } catch (err) {
@@ -196,6 +212,8 @@ app.get('/token/:subEntity?', async (req, res) => {
         sub_entity: subEntity
       });
     }
+    // Durable write confirmed — now safe to update the in-memory copy.
+    refreshTokens[subEntity] = data.refresh_token;
   }
 
   res.json({
@@ -244,23 +262,25 @@ app.get('/callback', async (req, res) => {
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
-    // Store the fresh refresh token in memory and persist to Railway.
-    // Persistence MUST succeed here too — a fresh OAuth grant that is not written
-    // back to Railway is lost on the next service restart. Fail closed (503).
+    // Persist the fresh OAuth grant to Railway FIRST, then update the in-memory
+    // copy only after the durable write confirms. Same ordering rationale as the
+    // /token route: mutating refreshTokens before a failed persist leaves the
+    // process serving a token that Railway never recorded, lost on next restart.
     if (data.refresh_token) {
-      refreshTokens[subEntity] = data.refresh_token;
       try {
         await persistTokenToRailway(subEntity, data.refresh_token);
       } catch (err) {
         console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
         return res.status(503).send(
           `<h2>Jobber OAuth completed for "${subEntity}" — but persistence FAILED</h2>` +
-          `<p>An access token was obtained and the refresh token is held in memory, ` +
-          `but writing it back to Railway failed: ${err.message}</p>` +
-          `<p><strong>This token will be lost on the next service restart.</strong> ` +
+          `<p>An access token was obtained, but writing the refresh token back to ` +
+          `Railway failed: ${err.message}</p>` +
+          `<p><strong>The refresh token was NOT stored.</strong> ` +
           `Fix the Railway API credentials/IDs and re-run the OAuth flow.</p>`
         );
       }
+      // Durable write confirmed — now safe to update the in-memory copy.
+      refreshTokens[subEntity] = data.refresh_token;
     }
 
     res.send(
