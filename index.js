@@ -11,6 +11,16 @@ function setFetch(fn) { fetch = fn; }
 // but shares the same app credentials (client_id + client_secret).
 const refreshTokens = {};
 
+// Sub-entities whose in-memory refresh token is NEWER than what Railway holds.
+// Jobber's refresh tokens are single-use and rotate on every refresh: once a
+// refresh succeeds, the OLD token may already be revoked, so the NEW token is
+// the only valid one and MUST be kept in memory even when the Railway write-back
+// fails. Discarding it would turn a transient Railway blip into a hard
+// invalid_grant outage. This set records "the in-memory token works but is not
+// durable across a restart" so the gap is visible (in the /token response and
+// /accounts) instead of silent. An entry is cleared once persistence succeeds.
+const nonDurableTokens = new Set();
+
 // Persist a rotated refresh token back to Railway env vars so it survives restarts.
 // Without this, Jobber's token rotation means the env var goes stale after first use.
 //
@@ -126,11 +136,19 @@ function loadTokens() {
   }
 }
 
-// Test helper: clear the in-memory token map and re-seed it directly.
-// Lets the suite register a known sub-entity without going through env vars.
+// Test helper: clear the in-memory token map (and the non-durable marker set)
+// and re-seed it directly. Lets the suite register a known sub-entity without
+// going through env vars, and keeps tests independent of each other.
 function _setTokensForTest(tokens) {
   for (const key of Object.keys(refreshTokens)) delete refreshTokens[key];
+  nonDurableTokens.clear();
   Object.assign(refreshTokens, tokens || {});
+}
+
+// Test helper: read the current in-memory refresh token for a sub-entity, so
+// the suite can assert what the service retained after a persistence failure.
+function _getTokenForTest(subEntity) {
+  return refreshTokens[subEntity];
 }
 
 loadTokens();
@@ -191,29 +209,35 @@ app.get('/token/:subEntity?', async (req, res) => {
     });
   }
 
-  // Jobber rotates refresh tokens — persist the new one to Railway FIRST, then
-  // update the in-memory copy only after the durable write succeeds. Order matters:
-  // if we mutated refreshTokens[subEntity] before persisting and persistence then
-  // failed, in-process refreshes would keep succeeding with the new token while
-  // Railway still holds the old one — masking the failure until the next restart,
-  // when the service reloads the stale env token and the integration breaks.
-  // Persisting first means a persistence failure leaves both memory and Railway
-  // on the previous token: consistent, and the 503 is the only signal needed.
+  // Jobber rotates refresh tokens and the OLD token may already be revoked the
+  // moment this refresh succeeded. So the rotated token is the ONLY valid token
+  // now — it MUST go into memory immediately, regardless of whether the durable
+  // write to Railway then succeeds. (Discarding it on a Railway failure would
+  // turn a transient blip into a hard invalid_grant outage, because the next
+  // request would retry with the revoked old token.)
+  //
+  // Persistence to Railway is a SEPARATE durability concern. If it fails, the
+  // in-memory token still works for the life of this process; we mark the
+  // sub-entity non-durable and return 503 so the caller knows a restart would
+  // lose the token — but the token itself is kept, not thrown away.
   if (data.refresh_token) {
+    refreshTokens[subEntity] = data.refresh_token;
     try {
       await persistTokenToRailway(subEntity, data.refresh_token);
+      nonDurableTokens.delete(subEntity);
     } catch (err) {
+      nonDurableTokens.add(subEntity);
       console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
       return res.status(503).json({
-        error: 'Refresh token rotated but could not be persisted',
-        detail: `Jobber rotated the refresh token for '${subEntity}' but writing it ` +
-          `back to Railway failed. The next refresh would use a stale token. ` +
-          `Investigate Railway API credentials/IDs before relying on this sub-entity.`,
+        error: 'Refresh token rotated and is in use, but could not be persisted',
+        detail: `Jobber rotated the refresh token for '${subEntity}'. The new token ` +
+          `is held in memory and works for now, but writing it back to Railway ` +
+          `failed — a service restart would lose it. Investigate Railway API ` +
+          `credentials/IDs before relying on this sub-entity across a restart.`,
+        non_durable: true,
         sub_entity: subEntity
       });
     }
-    // Durable write confirmed — now safe to update the in-memory copy.
-    refreshTokens[subEntity] = data.refresh_token;
   }
 
   res.json({
@@ -262,25 +286,27 @@ app.get('/callback', async (req, res) => {
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
-    // Persist the fresh OAuth grant to Railway FIRST, then update the in-memory
-    // copy only after the durable write confirms. Same ordering rationale as the
-    // /token route: mutating refreshTokens before a failed persist leaves the
-    // process serving a token that Railway never recorded, lost on next restart.
+    // A fresh OAuth grant produces a brand-new refresh token — keep it in
+    // memory immediately so a Railway persistence failure does not throw away
+    // a token the user just authorized. Then attempt the durable write; on
+    // failure, mark the sub-entity non-durable and report it, but retain the
+    // working token. Same model as the /token route.
     if (data.refresh_token) {
+      refreshTokens[subEntity] = data.refresh_token;
       try {
         await persistTokenToRailway(subEntity, data.refresh_token);
+        nonDurableTokens.delete(subEntity);
       } catch (err) {
+        nonDurableTokens.add(subEntity);
         console.error(`Token persistence failed for ${subEntity}: ${err.message}`);
         return res.status(503).send(
           `<h2>Jobber OAuth completed for "${subEntity}" — but persistence FAILED</h2>` +
-          `<p>An access token was obtained, but writing the refresh token back to ` +
-          `Railway failed: ${err.message}</p>` +
-          `<p><strong>The refresh token was NOT stored.</strong> ` +
-          `Fix the Railway API credentials/IDs and re-run the OAuth flow.</p>`
+          `<p>An access token was obtained and the refresh token is held in memory ` +
+          `(it works for now), but writing it back to Railway failed: ${err.message}</p>` +
+          `<p><strong>A service restart would lose this token.</strong> ` +
+          `Fix the Railway API credentials/IDs, then re-run the OAuth flow to persist it.</p>`
         );
       }
-      // Durable write confirmed — now safe to update the in-memory copy.
-      refreshTokens[subEntity] = data.refresh_token;
     }
 
     res.send(
@@ -294,11 +320,16 @@ app.get('/callback', async (req, res) => {
   }
 });
 
-// GET /accounts — list registered sub-entities (no secrets exposed)
+// GET /accounts — list registered sub-entities (no secrets exposed).
+// `non_durable_sub_entities` flags any sub-entity whose in-memory refresh token
+// is newer than what Railway holds — i.e. a persistence write-back failed and a
+// service restart would lose the rotated token. A monitor can poll this to catch
+// the durability gap without having to exercise the refresh path.
 app.get('/accounts', (req, res) => {
   res.json({
     sub_entities: Object.keys(refreshTokens),
-    count: Object.keys(refreshTokens).length
+    count: Object.keys(refreshTokens).length,
+    non_durable_sub_entities: Array.from(nonDurableTokens)
   });
 });
 
@@ -317,5 +348,6 @@ module.exports = {
   TokenPersistenceError,
   loadTokens,
   setFetch,
-  _setTokensForTest
+  _setTokensForTest,
+  _getTokenForTest
 };

@@ -8,6 +8,7 @@ const {
   TokenPersistenceError,
   setFetch,
   _setTokensForTest,
+  _getTokenForTest,
 } = require('./index');
 
 function createResponse({ ok, status, jsonBody, textBody = '' }) {
@@ -236,6 +237,45 @@ test.describe('GET /token/:subEntity — finding 2.1: surface Jobber rejection a
 
     assert.equal(response.status, 503);
     assert.notEqual(response.status, 200);
+  });
+
+  test('t8b: rotated token is RETAINED in memory when Railway persistence fails', async () => {
+    // Jobber rotates single-use refresh tokens — once the refresh succeeds the
+    // OLD token may already be revoked. So even though persistence failed (503),
+    // the NEW token must be kept in memory; discarding it would turn a transient
+    // Railway blip into a hard invalid_grant outage on the next request.
+    _setTokensForTest({ 'wise-gd': 'refresh-OLD' });
+    fetchStub = async (url) => {
+      if (url.includes('getjobber.com')) {
+        return createResponse({
+          ok: true,
+          status: 200,
+          jsonBody: { access_token: 'AT-1', refresh_token: 'refresh-NEW' },
+          textBody: '',
+        });
+      }
+      if (url.includes('railway.com')) {
+        return createResponse({
+          ok: false,
+          status: 500,
+          jsonBody: {},
+          textBody: 'err',
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    setFetch(fetchStub);
+
+    const { server, baseUrl } = await startApp();
+    currentServer = server;
+
+    const response = await fetch(`${baseUrl}/token/wise-gd`);
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.non_durable, true);
+    // The in-memory token is the freshly rotated one, NOT the (possibly revoked) old one.
+    assert.equal(_getTokenForTest('wise-gd'), 'refresh-NEW');
   });
 });
 
